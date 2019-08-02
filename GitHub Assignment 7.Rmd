@@ -1,0 +1,260 @@
+---
+title: "Predicting male and female speakers on Ted Talks transcripts"
+author: "Celine Van den Rul"
+date: "1st April 2019"
+output: html_notebook
+---
+
+# Predicting male and female speakers on Ted Talks transcripts using the naive bayes classifier
+
+In this exercise, I use a dataset containing the transcripts of 1060 Ted Talks and apply a naive bayes classifier to predict whether the talks were given by female or male speakers. To do this we rely mainly on the quanteda package.
+
+## Data preparation
+
+```{r}
+library(caret)
+library(dplyr)
+library(readr)
+library(quanteda)
+
+DATA_DIR <- "/Users/celinevdr/Desktop/"
+TedTalks <- read.csv(paste0(DATA_DIR,"ted_main_naivebayes.csv"))
+
+# Cleaning: removing audio descriptive content, columns with NAs
+TedTalks$transcript <- gsub("\\s*\\([^\\)]+\\)","",as.character(TedTalks$transcript)) 
+TedTalks <- TedTalks[!(is.na(TedTalks$speaker_occupation) | TedTalks$speaker_occupation==""), ]
+TedTalks <- TedTalks[!(is.na(TedTalks$transcript) | TedTalks$transcript==""), ]
+TedTalks <- TedTalks[!(is.na(TedTalks$Gender) | TedTalks$Gender==""), ]
+
+TedTalks <- TedTalks %>% select(-speaker_occupation)
+glimpse(TedTalks)
+
+TedTalks.c <- corpus(TedTalks, text_field = "transcript")
+summary(TedTalks.c, 5)
+```
+
+As a first step, I look at the distribution of my main variable of interest for this assignment: gender. The code below shows that I have a biased dataset: most of the speakers are male. This is a feature that we will have to consider carefully when we apply the naive bayes classifier as this might strongly influence the performance of the algorithm.  
+
+```{r}
+class_distribution <- TedTalks %>% group_by(Gender) %>% summarize(class_count=n())
+print(head(class_distribution))
+```
+
+I randomize the rows for future dataset selection, perform the basic pre-processing techniques on our corpus, including removing the stopwords and create a document feature matrix. 
+
+```{r}
+#Randomizing rows
+set.seed(1628)
+TedTalks_imbalanced <- TedTalks[sample(row.names (TedTalks)), ]
+
+# Pre-processing
+stop_words = stopwords("english")
+tok.all <- tokens(TedTalks.c, what="word",
+              remove_symbols = TRUE,
+              remove_punct = TRUE,
+              remove_numbers = TRUE,
+              remove_url= TRUE,
+              remove_hyphens = FALSE,
+              verbose = TRUE,
+              remove_twitter = TRUE,
+              include_docvars = TRUE)
+
+# Creating a document feature matrix
+TedTalks_dfm <- dfm(tok.all,
+                    tolower= TRUE,
+                    remove=stop_words,
+                    verbose=TRUE,
+                    include_docvars = TRUE)
+TedTalks_dfm
+```
+
+## Naive Bayes classification
+
+### Model 1
+
+I set up our dataset for a naive bayes classification using the quanteda package. As a first step, I need to divide my dataset between a training, a development test and a test set. Because I have randomized our rows in the previous code, I can confidently split my dataset in three accordingly. 
+```{r}
+#Dividing dtm into train, dev and test set.  
+TedTalks_dfm_train <- TedTalks_dfm[1:635, ] #60% of total observations
+TedTalks_dfm_dev <- TedTalks_dfm[636:847, ] #20% of total observations
+TedTalks_dfm_test <- TedTalks_dfm[848:1060, ] #20% of total observations
+
+TedTalks_train_labels <- TedTalks_imbalanced[1:635, ]$Gender
+TedTalks_dev_labels <- TedTalks_imbalanced[636:847, ]$Gender
+TedTalks_test_labels <- TedTalks_imbalanced[848:1060, ]$Gender
+
+```
+
+An important consideration for the division of my datasets in three is that we keep approximately the same class distribution across them. This is confirmed by the results below. 
+
+```{r}
+TedTalks_train_labels %>%
+  table %>%
+  prop.table
+```
+My training set has a distribution of 22% female and 78% male speakers. 
+
+```{r}
+TedTalks_dev_labels %>%
+  table %>%
+  prop.table
+```
+My development set has a distribution of 32% female and 68% male speakers. 
+
+```{r}
+TedTalks_test_labels %>%
+  table %>%
+  prop.table
+```
+My test set has a distribution of28% female and 73% male speakers.
+
+Now, I train my naive bayes classifier
+```{r}
+nb_model <- textmodel_nb(TedTalks_dfm_train, docvars(TedTalks_dfm_train, "Gender"))
+summary(nb_model)
+
+dfmat_matched <- dfm_match(TedTalks_dfm_dev, features = featnames(TedTalks_dfm_train))
+
+actual_class <- docvars(dfmat_matched, "Gender")
+predicted_class <- predict(nb_model, newdata = dfmat_matched)
+
+tab_class <- table(actual_class, predicted_class)
+tab_class
+```
+I can already see that my model is much better at predicting the male class than the female class.
+
+### Assessment of Model 1
+
+To evaluate my model, I show the confusion matrix below. To do this I rely on the following metrics: accuracy, precision, recall and F1. With a level of accuracy of 0.6557 we could say that my model is performing well. However, in the case of our biased dataset, looking at accuracy levels as a metric for model performance is misleading as one could predict the dominant class most of the time and still achieve a relatively high overall accuracy. A precision of 0.083 indicates that my model has a high number of false positives. Similarly, a recall of 0.461 also indicates that my model has some false negatives. F1=0.141 is also low and suggests a weak accuracy of this model. Thus, even though the level of accuracy for my model, other metrics suggest that my model does not fare well at predicting whether or not the TED talk speakers are male or female. This is largely due to the fact that my dataset is imbalanced, with mostly male speakers. This severly impacts the performance of the naive bayes algorithm.  
+
+
+```{r}
+confusionMatrix(tab_class, mode="everything")
+```
+
+### Model 2
+
+To remedy to this, I rely on a common sampling method. Basically, I seek to transform my imbalanced data into a balanced distribution so that I can improve my model. The modification occurs by altering the size of the original dataset and provide the same proportion of balance. 
+
+In R, packages such as ROSE and DMwR help us to perform sampling strategies quickly. In this exercise, I will use the ROSE package. This package provides a function names ovun.sample which enables oversampling and undersampling in one go. 
+
+In a first step I start with oversampling: I bring the female number to an equal level with the male number (795 each). In other words, I have instructued this line of code to over sample our minority female class until it reaches 795 and thus the total set comprises 1590 observations. 
+```{r}
+library(ROSE)
+data_balanced_over <- ovun.sample(Gender ~ ., data = TedTalks, method = "over",N = 1590)$data
+table(data_balanced_over$Gender)
+```
+
+In a second step, I perform undersampling: I lower the number of observations for my majority class (male) to equal my minority class (female). In other words, I have instructed this line of code to under sample the male class until it reached 265 and thus the total set is reduced to 530 observations.
+```{r}
+data_balanced_under <- ovun.sample(Gender ~ ., data = TedTalks, method = "under",N = 530)$data
+table(data_balanced_under$Gender)
+```
+
+In a final step, I achieve balance by compining both under and oversampling methods. This can be achieved using the methode=both. In this case, the minority class is oversampled with replacement and the majority class is undersampled without replacement. This balanced dataset is considered best to fit my model as simply oversampling can lead to a number of repeated observations while simply undersampling can deprive the dataset from important information from the original data. 
+
+```{r}
+TedTalks_balanced <- ovun.sample(Gender ~ ., data = TedTalks, method = "both",p=0.5, N=1060, seed=1)$data
+table(TedTalks_balanced$Gender)
+```
+
+As such, I now prepare my new balanced dataset for the naive bayes classifier, performing the same randomisation procedure as in Model 1. 
+```{r}
+set.seed(1628)
+TedTalks_balanced$transcript <- as.character(TedTalks_balanced$transcript)
+TedTalks_balanced <- TedTalks_balanced[sample(row.names (TedTalks_balanced)), ]
+TedTalks_balanced.c <- corpus(TedTalks_balanced, text_field = "transcript")
+summary(TedTalks_balanced.c, 5)
+```
+
+I also perform the basic preprocessing and dfm transformations as for Model 1. 
+```{r}
+tok.balanced <- tokens(TedTalks_balanced.c, what="word",
+              remove_symbols = TRUE,
+              remove_punct = TRUE,
+              remove_numbers = TRUE,
+              remove_url= TRUE,
+              remove_hyphens = FALSE,
+              verbose = TRUE,
+              remove_twitter = TRUE,
+              include_docvars = TRUE)
+
+# Creating a document feature matrix
+TedTalks_dfm2 <- dfm(tok.balanced,
+                    tolower= TRUE,
+                    remove=stop_words,
+                    verbose=TRUE,
+                    include_docvars = TRUE)
+```
+
+Similar to Model 1, I split our dataset randomly between a training set (60% of the observations), a dev test (20% of the observations) and a test set (20% of the observations).
+```{r}
+TedTalks_dfm_train2 <- TedTalks_dfm2[1:635, ] #60% of total observations
+TedTalks_dfm_dev2 <- TedTalks_dfm2[636:847, ] #20% of total observations
+TedTalks_dfm_test2 <- TedTalks_dfm2[848:1060, ] #20% of total observations
+
+TedTalks_train_labels2 <- TedTalks_balanced[1:635, ]$Gender
+TedTalks_dev_labels2 <- TedTalks_balanced[636:847, ]$Gender
+TedTalks_test_labels2 <- TedTalks_balanced[848:1060, ]$Gender
+```
+
+Similarly, I check that my class Gender follows approximately the same distribution in all three sets. This is confirmed by the results below. 
+
+```{r}
+TedTalks_train_labels2 %>%
+  table %>%
+  prop.table
+```
+My training set has 50% male speakers and 50% female speakers
+
+```{r}
+TedTalks_dev_labels2 %>%
+  table %>%
+  prop.table
+```
+My dev test has 56% male speakers and 44% female speakers. 
+
+```{r}
+TedTalks_test_labels2 %>%
+  table %>%
+  prop.table
+```
+My test set has 54% male speakers and 46% female speakers
+
+Now, I can apply naive base classifyer on my balanced dataset. The table below already shows us that Model 2 fares much better at predicting both the male and female class once our dataset is more balanced. 
+
+```{r}
+nb_model2 <- textmodel_nb(TedTalks_dfm_train2, docvars(TedTalks_dfm_train2, "Gender"))
+summary(nb_model2)
+
+dfmat_matched2 <- dfm_match(TedTalks_dfm_dev2, features = featnames(TedTalks_dfm_train2))
+
+actual_class2 <- docvars(dfmat_matched2, "Gender")
+predicted_class2 <- predict(nb_model2, newdata = dfmat_matched2)
+
+tab_class2 <- table(actual_class2, predicted_class2)
+tab_class2
+```
+
+### Assessment of Model 2
+
+Equally, Model 2 also fares much better when it comes to evaluating its performance. The level of accuracy is higher but most importantly, I have high levels of precision, recall and F1 which indicates the low number of false positives or false negatives. Thus, by balancing the dataset using the ROSE package I was able to significantly improve the performance of the algorithm in predicting whether or not a TED transcript was from a male or female speaker. 
+
+```{r}
+confusionMatrix(tab_class2, mode="everything")
+```
+
+### Model 2 on test set
+
+Finally, I test Model 2 on the test set. The results of the confusion matrix shows that the model performs well in predicting the gender of the TED Talk speakers. I have very similar accuracy, precision, recall and F1 values than on the dev test. 
+```{r}
+dfmat_matched3 <- dfm_match(TedTalks_dfm_test2, features = featnames(TedTalks_dfm_train2))
+actual_class3 <- docvars(dfmat_matched3, "Gender")
+predicted_class3 <- predict(nb_model2, newdata = dfmat_matched3)
+
+tab_class3 <- table(actual_class3, predicted_class3)
+tab_class3
+
+confusionMatrix(tab_class3, mode="everything")
+```
+
